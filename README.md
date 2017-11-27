@@ -1,2 +1,2 @@
 # nextproxy
-a http tunnel proxy which supports normal mode and relay mode
+a http tunnel proxy with normal mode and relay mode
