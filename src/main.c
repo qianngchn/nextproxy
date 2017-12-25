@@ -5,37 +5,54 @@
 #include <time.h>
 #include <unistd.h>
 #include <regex.h>
-#include "event.h"
 #include "socket.h"
+#include "event.h"
 
-#if defined(__linux) || defined(__linux__) || defined(linux)
+#if defined(__linux__) || defined(__unix__)
 #include <netinet/tcp.h>
 #else
 #include <ws2tcpip.h>
 #endif
 
 #define BUFF_SIZE (1024 >> 1)
-#define MAX_HEADER_SIZE (1024 << 2)
 #define MAX_DATA_SIZE (1024 << 10)
+
 #define MAX_CLIENTS FD_SETSIZE
+#define PROXY_TIMEOUT 10.0
+
+enum {
+    PROXY_HAS_NONE    = 0x00,
+    PROXY_HAS_CONNECT = 0x01,
+    PROXY_HAS_TUNNEL  = 0x02,
+    PROXY_HAS_NOTEND  = 0x04
+};
 
 typedef struct proxy {
     int client;
+    EVENT_IO client_read;
+    EVENT_IO client_write;
+
     int remote;
-    int tunnel;
-    char header[MAX_HEADER_SIZE];
-    ssize_t header_size;
+    EVENT_IO remote_read;
+    EVENT_IO remote_write;
+
+    EVENT_TIMER timer_clean;
+
+    int status;
+
     char data[MAX_DATA_SIZE];
-    ssize_t data_sid;
-    ssize_t data_rid;
-    struct proxy *next;
+    ssize_t data_size;
+    ssize_t data_index;
 } PROXY;
 
-static PROXY list = {0, 0, 0, {0}, 0, {0}, 0, 0, NULL};
+static EVENT_LOOP *loop = NULL;
+static EVENT_IO local_accept;
+
+static int local = INVALID_SOCKET;
 static int clients = 0;
-static int relay_mode = 0;
+
 static int ipv6_mode = 0;
-static int local_tcp = INVALID_SOCKET;
+static int relay_mode = 0;
 
 static int debug_flag = 0;
 static int logger_flag = 0;
@@ -43,16 +60,18 @@ static FILE *logger_file = NULL;
 
 static void print_log(const char *format, ...) {
     if (debug_flag || logger_flag) {
-        char buff[128];
-        char message[128];
+        char buff[128], message[128];
         time_t now = time(NULL);
         va_list ap;
-        strftime(buff, sizeof(buff), "%m-%d %H:%M:%S", localtime(&now));
+
         va_start(ap, format);
+        strftime(buff, sizeof(buff), "%m-%d %H:%M:%S", localtime(&now));
         vsnprintf(message, sizeof(message), format, ap);
         va_end(ap);
+
         if (debug_flag)
             printf("[%s] %s\n", buff, message);
+
         if (logger_flag && logger_file != NULL)
             fprintf(logger_file, "[%s] %s\n", buff, message);
     }
@@ -60,28 +79,38 @@ static void print_log(const char *format, ...) {
 
 static int match_regex(const char *text, const char *pattern, const int index, char *result) {
     regex_t regex;
+
     if (regcomp(&regex, pattern, REG_EXTENDED | REG_ICASE | REG_NEWLINE) == 0) {
         regmatch_t match[regex.re_nsub + 1];
+
         if (regexec(&regex, text, regex.re_nsub + 1, match, 0) == 0) {
             if (result != NULL) {
                 int start = match[index].rm_so, end = match[index].rm_eo;
+
                 strncpy(result, text + start, end - start);
                 result[end - start] = 0;
             }
+
             regfree(&regex);
-            return 0;
+
+            return 1;
         }
     }
+
     regfree(&regex);
-    return 1;
+
+    return 0;
 }
 
 static inline void set_socket(int fd) {
     socket_setasync(fd);
+
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt));
+
     opt = MAX_DATA_SIZE;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (char *)&opt, sizeof(opt));
+
     opt = MAX_DATA_SIZE;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (char *)&opt, sizeof(opt));
 }
@@ -94,59 +123,42 @@ static inline void set_cork(int fd, int opt) {
     setsockopt(fd, IPPROTO_TCP, TCP_CORK, (char *)&opt, sizeof(opt));
 }
 
-static PROXY *add_proxy(PROXY *head) {
-    PROXY *cur = (PROXY *)malloc(sizeof(PROXY));
-    cur->client = INVALID_SOCKET;
-    cur->remote = INVALID_SOCKET;
-    cur->tunnel = 0;
-    *(cur->header) = 0;
-    cur->header_size = 0;
-    *(cur->data) = 0;
-    cur->data_sid = 0;
-    cur->data_rid = 0;
-    cur->next = head->next;
-    head->next = cur;
-    return cur;
+static inline PROXY *new_proxy(void) {
+    PROXY *node = (PROXY *)malloc(sizeof(PROXY));
+    if (node == NULL) return NULL;
+    memset(node, 0, sizeof(PROXY));
+
+    node->client = INVALID_SOCKET;
+    node->remote = INVALID_SOCKET;
+    node->status = PROXY_HAS_NONE;
+    *(node->data) = 0;
+    node->data_size = 0;
+    node->data_index = 0;
+
+    return node;
 }
 
-static void remove_proxy(int fd, PROXY *head) {
-    PROXY *prev = head;
-    PROXY *cur = prev->next;
-    while (cur != NULL) {
-        if (cur->client == fd || cur->remote == fd) {
-            PROXY *temp = cur;
-            prev->next = cur->next;
-            cur = cur->next;
-            if (temp->client != INVALID_SOCKET) socket_close(temp->client);
-            if (temp->remote != INVALID_SOCKET) socket_close(temp->remote);
-            free(temp); temp = NULL;
-            break;
-        } else {
-            prev = cur;
-            cur = cur->next;
-        }
-    }
+static inline void delete_proxy(PROXY *node) {
+    if (node->client != INVALID_SOCKET)
+        socket_close(node->client);
+
+    if (node->remote != INVALID_SOCKET)
+        socket_close(node->remote);
+
+    free(node);
 }
 
-static void clean_proxy(PROXY *head) {
-    while (head->next != NULL) {
-        PROXY *cur = head->next;
-        head->next = cur->next;
-        if (cur->client != INVALID_SOCKET) socket_close(cur->client);
-        if (cur->remote != INVALID_SOCKET) socket_close(cur->remote);
-        free(cur); cur = NULL;
-    }
-}
-
-static void handle_header(char *buff, char *host, char *port) {
-    // todo: relay to sock5 or shadowsocks header
-    int i = 0, j = 0, k = 0;
-    while (*(buff + i) != ' ') i++;
+static int handle_header(char *buff, char *host, char *port) {
     if (strncmp(buff, "GET", 3) == 0) {
+        int i = 0, j = 0, k = 0;
+        while (*(buff + i) != ' ') ++i;
+
         j = i + 8;
-        while (*(buff + j) != '/') j++;
-        for (k = i + 8; k < j; k++)
+        while (*(buff + j) != '/') ++j;
+
+        for (k = i + 8; k < j; ++k)
             if (*(buff + k) == ':') break;
+
         if (k != j) {
             strncpy(host, buff + i + 8, k - i - 8);
             strncpy(port, buff + k + 1, j - k - 1);
@@ -154,12 +166,18 @@ static void handle_header(char *buff, char *host, char *port) {
             strncpy(host, buff + i + 8, j - i - 8);
             strcpy(port, "80");
         }
+
         sprintf(buff, "GET %s", buff + j);
     } else if (strncmp(buff, "CONNECT", 7) == 0) {
+        int i = 0, j = 0, k = 0;
+        while (*(buff + i) != ' ') ++i;
+
         j = i + 1;
-        while (*(buff + j) != ' ') j++;
-        for (k = i + 1; k < j; k++)
+        while (*(buff + j) != ' ') ++j;
+
+        for (k = i + 1; k < j; ++k)
             if (*(buff + k) == ':') break;
+
         if (k != j) {
             strncpy(host, buff + i + 1, k - i - 1);
             strncpy(port, buff + k + 1, j - k - 1);
@@ -167,201 +185,274 @@ static void handle_header(char *buff, char *host, char *port) {
             strncpy(host, buff + i + 1, j - i - 1);
             strcpy(port, "443");
         }
+
         sprintf(buff, "HTTP/1.1 200 Tunnel established\n\n");
-    }
+    } else
+        return 0;
+
+    // todo: relay to sock5 or shadowsocks header
+    return 1;
 }
 
-static void handle_data(char * buff) {
+static int handle_data(char * buff) {
     // todo: handle socks5 or shadowsocks data
+    return 1;
 }
 
-static void remote_tcp_cb(int fd, const int event, void *data) {
-    print_log("fd: %d, event: %d, callback: %s, start", fd, event, __FUNCTION__);
-    ssize_t len = 0; int error = 0, retry = 0;
-    PROXY *head = (PROXY *)&list;
-    PROXY *cur = head->next;
-    while (cur != NULL) {
-        if (cur->remote == fd) break;
-        cur = cur->next;
-    }
-    switch (event) {
-        case EVENT_IO_READ:
-            len = socket_recv(cur->remote, cur->data + cur->data_rid, MAX_DATA_SIZE - cur->data_rid, 0, &retry);
-            printf("%s", cur->header);
-            printf("%ld %d %d\n", len, error, retry);
-            if (retry == 0) {
-                if (len > 0 && len < MAX_DATA_SIZE) {
-                    cur->data_rid += len;
-                    event_io_start(cur->client, EVENT_IO_WRITE);
-                } else {
-                    if (len == MAX_DATA_SIZE)
-                        print_log("http data too large: %d", len);
-                    print_log("close remote socket: %d", cur->remote);
-                    event_io_remove(cur->remote, EVENT_IO_READ);
-                    event_io_remove(cur->remote, EVENT_IO_WRITE);
-                    event_io_stop(cur->client, EVENT_IO_WRITE);
-                    socket_close(cur->remote);
-                    cur->remote = INVALID_SOCKET;
-                    *(cur->data) = 0;
-                    cur->data_sid = 0;
-                    cur->data_rid = 0;
-                }
-            }
-            break;
-        case EVENT_IO_WRITE:
-            len = socket_send(cur->remote, cur->header, cur->header_size, 0, &retry);
-            printf("%s", cur->header);
-            printf("%ld %d %d\n", len, error, retry);
-            if (retry == 0) {
-                if (len >= 0) {
-                    if (len == cur->header_size) {
-                        event_io_stop(cur->remote, EVENT_IO_WRITE);
-                        *(cur->header) = 0;
-                        cur->header_size = 0;
-                    }
-                } else {
-                    print_log("close remote socket: %d", cur->remote);
-                    event_io_remove(cur->remote, EVENT_IO_READ);
-                    event_io_remove(cur->remote, EVENT_IO_WRITE);
-                    event_io_start(cur->client, EVENT_IO_READ);
-                    socket_close(cur->remote);
-                    cur->remote = INVALID_SOCKET;
-                    *(cur->header) = 0;
-                    cur->header_size = 0;
-                }
-            }
-            break;
-    }
-    print_log("fd: %d, event: %d, callback: %s, exit", fd, event, __FUNCTION__);
+static void timer_clean_cb(EVENT_LOOP *loop, EVENT_TIMER *watcher) {
+    print_log("timeout: %lf, repeat: %lf, callback: %s, enter", watcher->timeout, watcher->repeat, __func__);
+
+    PROXY *node = (PROXY *)(watcher->data);
+
+    event_io_stop(loop, &node->client_read);
+    event_io_stop(loop, &node->client_write);
+    event_io_stop(loop, &node->remote_read);
+    event_io_stop(loop, &node->remote_write);
+    event_timer_stop(loop, &node->timer_clean);
+
+
+    delete_proxy(node);
+
+    if (clients == MAX_CLIENTS)
+        event_io_start(loop, &local_accept);
+
+    --clients;
 }
 
-static void client_tcp_cb(int fd, const int event, void *data) {
-    print_log("fd: %d, event: %d, callback: %s, start", fd, event, __FUNCTION__);
-    ssize_t len = 0; int error = 0, retry = 0;
-    PROXY *head = (PROXY *)&list;
-    PROXY *cur = head->next;
-    while (cur != NULL) {
-        if (cur->client == fd) break;
-        cur = cur->next;
+static void remote_write_cb(EVENT_LOOP *loop, EVENT_IO *watcher) {
+    print_log("fd: %d, events: %d, callback: %s, enter", watcher->fd, watcher->events, __func__);
+
+    PROXY *node = (PROXY *)(watcher->data);
+    event_io_stop(loop, &node->remote_write);
+    event_timer_stop(loop, &node->timer_clean);
+
+    ssize_t len = 0; int ignore = 0;
+    len = socket_send(node->remote, node->data + node->data_index, node->data_size - node->data_index, 0, &ignore);
+    if (len > 0) node->data_index += len;
+
+    if (len < 0 && ignore == 0) {
+        print_log("remote socket write error: %d", node->remote);
+
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    } else if ((len < 0 && ignore == 1) || node->data_index < node->data_size) {
+        print_log("remote socket write retry: %d", node->remote);
+
+        event_io_start(loop, &node->remote_write);
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
     }
-    switch (event) {
-        case EVENT_IO_READ:
-            len = socket_recv(cur->client, cur->header, MAX_HEADER_SIZE, 0, &retry);
-            printf("%ld %d %d\n", len, error, retry);
-            if (retry == 0) {
-                if (len > 0 && len < MAX_HEADER_SIZE) {
-                    *(cur->header + len) = 0;
-                    if (cur->remote == INVALID_SOCKET) {
-                        int sock = 0;
-                        if (ipv6_mode == 0)
-                            sock = socket_create(AF_INET, SOCK_STREAM, 0);
-                        else
-                            sock = socket_create(AF_INET6, SOCK_STREAM, 0);
-                        if (sock > 0) {
-                            cur->remote = sock;
-                            set_socket(cur->remote);
-                            event_io_add(cur->remote, EVENT_IO_READ, head, remote_tcp_cb);
-                            event_io_add(cur->remote, EVENT_IO_WRITE, head, remote_tcp_cb);
-                        }
-                    }
-                    if (cur->tunnel == 0) {
-                        char host[BUFF_SIZE] = {0}, port[BUFF_SIZE] = {0};
-                        handle_header(cur->header, host, port);
-                        cur->header_size = strlen(cur->header);
-                        if (strcmp(port, "443") == 0) {
-                            cur->tunnel = 1;
-                            socket_send(cur->client, cur->header, strlen(cur->header), 0, NULL);
-                            *(cur->header) = 0;
-                            cur->header_size = 0;
-                        }
-                        if (cur->remote != INVALID_SOCKET && socket_connect(cur->remote, host, port, NULL) == 0) {
-                            print_log("connect to %s:%s, using socket: %d", host, port, cur->remote);
-                            if (cur->tunnel == 0) {
-                                event_io_start(cur->remote, EVENT_IO_READ);
-                                event_io_start(cur->remote, EVENT_IO_WRITE);
-                            }
-                        } else {
-                            print_log("connect remote socket error: %d", cur->remote);
-                            event_io_remove(cur->remote, EVENT_IO_READ);
-                            event_io_remove(cur->remote, EVENT_IO_WRITE);
-                            socket_close(cur->remote);
-                            cur->remote = INVALID_SOCKET;
-                        }
-                    } else {
-                        cur->header_size = len;
-                        event_io_start(cur->remote, EVENT_IO_READ);
-                        event_io_start(cur->remote, EVENT_IO_WRITE);
-                    }
-                    // todo: all timeout to free connection
-                } else {
-                    if (len == MAX_HEADER_SIZE)
-                        print_log("http header too large: %d", len);
-                    print_log("close client socket: %d", cur->client);
-                    event_io_remove(cur->remote, EVENT_IO_READ);
-                    event_io_remove(cur->remote, EVENT_IO_WRITE);
-                    event_io_remove(cur->client, EVENT_IO_READ);
-                    event_io_remove(cur->client, EVENT_IO_WRITE);
-                    remove_proxy(cur->client, head);
-                    if (clients == MAX_CLIENTS)
-                        event_io_start(local_tcp, EVENT_IO_READ);
-                    clients--;
-                }
-            }
-            break;
-        case EVENT_IO_WRITE:
-            len = socket_send(cur->client, cur->data + cur->data_sid, cur->data_rid - cur->data_sid, 0, &retry);
-            printf("%s", cur->header);
-            printf("%ld %d %d\n", len, error, retry);
-            if (retry == 0) {
-                if (len >= 0) {
-                    cur->data_sid += len;
-                    if (cur->data_sid == cur->data_rid)
-                        event_io_stop(cur->client, EVENT_IO_WRITE);
-                } else {
-                    print_log("close client socket: %d", cur->client);
-                    event_io_remove(cur->remote, EVENT_IO_READ);
-                    event_io_remove(cur->remote, EVENT_IO_WRITE);
-                    event_io_remove(cur->client, EVENT_IO_WRITE);
-                    event_io_remove(cur->client, EVENT_IO_READ);
-                    remove_proxy(cur->client, head);
-                    if (clients == MAX_CLIENTS)
-                        event_io_start(local_tcp, EVENT_IO_READ);
-                    clients--;
-                }
-            }
-            break;
+
+    *(node->data) = 0;
+    node->data_size = 0;
+    node->data_index = 0;
+
+    if (node->status & PROXY_HAS_NOTEND) {
+        event_io_start(loop, &node->client_read);
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
     }
-    print_log("fd: %d, event: %d, callback: %s, exit", fd, event, __FUNCTION__);
+
+    event_io_start(loop, &node->remote_read);
+    event_timer_start(loop, &node->timer_clean);
 }
 
-static void local_tcp_cb(int fd, const int event, void *data) {
-    print_log("fd: %d, event: %d, callback: %s, start", fd, event, __FUNCTION__);
-    int sock = INVALID_SOCKET;
-    char host[BUFF_SIZE] = {0};
-    int error = 0, retry = 0;
-    if (event == EVENT_IO_READ) {
-        if (clients == MAX_CLIENTS) {
-            print_log("%d clients online, stop listening for more clients", clients);
-            event_io_stop(local_tcp, EVENT_IO_READ);
-        } else {
-            sock = socket_accept(fd, host, NULL, &retry);
-            if (retry == 0) {
-                if (sock != INVALID_SOCKET) {
-                    clients++;
-                    print_log("accept client: %s, total: %d, using socket: %d", host, clients, sock);
-                    set_socket(sock);
-                    PROXY *head = (PROXY *)&list;
-                    PROXY *cur = add_proxy(head);
-                    cur->client = sock;
-                    event_io_add(cur->client, EVENT_IO_READ, head, client_tcp_cb);
-                    event_io_add(cur->client, EVENT_IO_WRITE, head, client_tcp_cb);
-                    event_io_start(cur->client, EVENT_IO_READ);
-                } else
-                    print_log("accept client error: %d", error);
-            }
+static void remote_read_cb(EVENT_LOOP *loop, EVENT_IO *watcher) {
+    print_log("fd: %d, events: %d, callback: %s, enter", watcher->fd, watcher->events, __func__);
+
+    PROXY *node = (PROXY *)(watcher->data);
+    event_io_stop(loop, &node->remote_read);
+    event_timer_stop(loop, &node->timer_clean);
+
+    ssize_t len = 0; int ignore = 0;
+    len = socket_recv(node->remote, node->data, MAX_DATA_SIZE, 0, &ignore);
+
+    if ((len < 0 && ignore == 0) || len == 0) {
+        print_log("remote socket read error: %d", node->remote);
+
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    } else if (len < 0 && ignore == 1) {
+        print_log("remote socket read retry: %d", node->remote);
+
+        event_io_start(loop, &node->remote_read);
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    }
+
+    node->data_size = len;
+
+    event_io_start(loop, &node->client_write);
+    event_timer_start(loop, &node->timer_clean);
+}
+
+static void client_write_cb(EVENT_LOOP *loop, EVENT_IO *watcher) {
+    print_log("fd: %d, events: %d, callback: %s, enter", watcher->fd, watcher->events, __func__);
+
+    PROXY *node = (PROXY *)(watcher->data);
+    event_io_stop(loop, &node->client_write);
+    event_timer_stop(loop, &node->timer_clean);
+
+    ssize_t len = 0; int ignore = 0;
+    len = socket_send(node->client, node->data + node->data_index, node->data_size - node->data_index, 0, &ignore);
+    if (len > 0) node->data_index += len;
+
+    if (len < 0 && ignore == 0) {
+        print_log("client socket write error: %d", node->client);
+
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    } else if ((len < 0 && ignore == 1) || node->data_index < node->data_size) {
+        print_log("client socket write retry: %d", node->client);
+
+        event_io_start(loop, &node->client_write);
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    }
+
+    *(node->data) = 0;
+    node->data_size = 0;
+    node->data_index = 0;
+
+    event_io_start(loop, &node->remote_read);
+    event_timer_start(loop, &node->timer_clean);
+}
+
+static void client_read_cb(EVENT_LOOP *loop, EVENT_IO *watcher) {
+    print_log("fd: %d, events: %d, callback: %s, enter", watcher->fd, watcher->events, __func__);
+
+    PROXY *node = (PROXY *)(watcher->data);
+    event_io_stop(loop, &node->client_read);
+    event_timer_stop(loop, &node->timer_clean);
+
+    ssize_t len = 0; int ignore = 0;
+    len = socket_recv(node->client, node->data, MAX_DATA_SIZE, 0, &ignore);
+
+    if ((len < 0 && ignore == 0) || len == 0) {
+        print_log("client socket read error: %d", node->client);
+
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    } else if (len < 0 && ignore == 1) {
+        print_log("client socket read retry: %d", node->client);
+
+        event_io_start(loop, &node->client_read);
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    }
+
+    node->data_size = len;
+
+    if (len == MAX_DATA_SIZE)
+        node->status |= PROXY_HAS_NOTEND;
+    else if (node->status & PROXY_HAS_NOTEND)
+        node->status ^= PROXY_HAS_NOTEND;
+
+    if (node->status & PROXY_HAS_CONNECT) {
+        event_io_start(loop, &node->remote_write);
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    }
+
+    char host[BUFF_SIZE] = {0}, port[BUFF_SIZE] = {0};
+
+    if (!handle_header(node->data, host, port)) {
+        print_log("handle header error, not supported protocol");
+
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    }
+
+    if (node->remote == INVALID_SOCKET) {
+        if (ipv6_mode == 0)
+            node->remote = socket_create(AF_INET, SOCK_STREAM, 0);
+        else
+            node->remote = socket_create(AF_INET6, SOCK_STREAM, 0);
+
+        if (node->remote == INVALID_SOCKET) {
+            print_log("remote socket create error: %d", node->remote);
+
+            event_timer_start(loop, &node->timer_clean);
+
+            return;
         }
+
+        set_socket(node->remote);
+        set_nodelay(node->remote, 1);
+
+        event_io_init(&node->remote_read, remote_read_cb, node->remote, EVENT_IO_READ);
+        event_io_init(&node->remote_write, remote_write_cb, node->remote, EVENT_IO_WRITE);
+        event_io_data(&node->remote_read, node);
+        event_io_data(&node->remote_write, node);
     }
-    print_log("fd: %d, event: %d, callback: %s, exit", fd, event, __FUNCTION__);
+
+    int ret = socket_connect(node->remote, host, port, &ignore);
+
+    if (ret < 0 && ignore == 0) {
+        print_log("connect remote socket error: %d", node->remote);
+
+        event_timer_start(loop, &node->timer_clean);
+
+        return;
+    }
+
+    print_log("connect to %s:%s, using socket: %d", host, port, node->remote);
+
+    node->status |= PROXY_HAS_CONNECT;
+
+    event_io_start(loop, &node->remote_write);
+    event_timer_start(loop, &node->timer_clean);
+}
+
+static void local_accept_cb(EVENT_LOOP *loop, EVENT_IO *watcher) {
+    print_log("fd: %d, events: %d, callback: %s, enter", watcher->fd, watcher->events, __func__);
+
+    if (clients == MAX_CLIENTS) {
+        print_log("%d client(s) online, stop listening for more clients", clients);
+
+        event_io_stop(loop, &local_accept);
+    } else {
+        char host[BUFF_SIZE] = {0}, port[BUFF_SIZE] = {0};
+
+        int client = socket_accept(local, host, port, NULL);
+
+        if (client == INVALID_SOCKET) return;
+
+        set_socket(client);
+        set_nodelay(client, 1);
+
+        PROXY *node = new_proxy();
+
+        if (node == NULL) { socket_close(client); return; }
+
+        ++clients;
+
+        print_log("accept client: %s/%s, total: %d, using socket: %d", host, port, clients, client);
+
+        node->client = client;
+
+        event_io_init(&node->client_read, client_read_cb, client, EVENT_IO_READ);
+        event_io_init(&node->client_write, client_write_cb, client, EVENT_IO_WRITE);
+        event_timer_init(&node->timer_clean, timer_clean_cb, PROXY_TIMEOUT, 0);
+
+        event_io_data(&node->client_read, node);
+        event_io_data(&node->client_write, node);
+        event_timer_data(&node->timer_clean, node);
+
+        event_io_start(loop, &node->client_read);
+        event_timer_start(loop, &node->timer_clean);
+    }
 }
 
 static void usage(const char *name) {
@@ -384,23 +475,26 @@ int main(int argc, char **argv) {
     char remote_method[BUFF_SIZE] = {0};
     char remote_password[BUFF_SIZE] = {0};
     int opt = 0; char result[BUFF_SIZE] = {0};
+
     while ((opt = getopt(argc, argv, "l:p:6gdh")) != -1) {
         switch (opt) {
             case 'l':
-                if (match_regex(optarg, "(.+)://(.+):(.+)", 1, result) == 0)
+                if (match_regex(optarg, "(.+)://(.+):(.+)", 1, result))
                     strcpy(local_protocol, result);
-                if (match_regex(optarg, "(.+)://(.+):(.+)", 2, result) == 0)
+                if (match_regex(optarg, "(.+)://(.+):(.+)", 2, result))
                     strcpy(local_host, result);
-                if (match_regex(optarg, "(.+)://(.+):(.+)", 3, result) == 0)
+                if (match_regex(optarg, "(.+)://(.+):(.+)", 3, result))
                     strcpy(local_port, result);
+
                 if (strcmp(local_protocol, "http") != 0) {
                     printf("%s is not supported local protocol, now trying http proxy\n", local_protocol);
                     sprintf(local_protocol, "http");
                 }
                 break;
             case 'p':
-                if (match_regex(optarg, "(.+)://(.+):(.+)@(.+):(.+)", 0, NULL) == 0) {
+                if (match_regex(optarg, "(.+)://(.+):(.+)@(.+):(.+)", 0, NULL)) {
                     relay_mode = 1;
+
                     if (match_regex(optarg, "(.+)://(.+):(.+)@(.+):(.+)", 1, result))
                         strcpy(remote_protocol, result);
                     if (match_regex(optarg, "(.+)://(.+):(.+)@(.+):(.+)", 2, result))
@@ -411,18 +505,21 @@ int main(int argc, char **argv) {
                         strcpy(remote_host, result);
                     if (match_regex(optarg, "(.+)://(.+):(.+)@(.+):(.+)", 5, result))
                         strcpy(remote_port, result);
+
                     if (strcmp(remote_protocol, "ss") != 0) {
                         printf("%s is not supported remote protocol, now trying shadowsocks proxy\n", remote_protocol);
                         sprintf(remote_protocol, "ss");
                     }
-                } else if (match_regex(optarg, "(.+)://(.+):(.+)", 0, NULL) == 0) {
+                } else if (match_regex(optarg, "(.+)://(.+):(.+)", 0, NULL)) {
                     relay_mode = 1;
+
                     if (match_regex(optarg, "(.+)://(.+):(.+)", 1, result))
                         strcpy(remote_protocol, result);
                     if (match_regex(optarg, "(.+)://(.+):(.+)", 2, result))
                         strcpy(remote_host, result);
                     if (match_regex(optarg, "(.+)://(.+):(.+)", 3, result))
                         strcpy(remote_port, result);
+
                     if (strcmp(remote_protocol, "socks5") != 0) {
                         printf("%s is not supported remote protocol, now trying socks5 proxy\n", remote_protocol);
                         sprintf(remote_protocol, "socks5");
@@ -454,37 +551,43 @@ int main(int argc, char **argv) {
     } else
         printf("normal proxy mode, local_server: %s://%s:%s\n", local_protocol, local_host, local_port);
 
+    if (socket_init() == SOCKET_ERROR) return 1;
+
+    if (ipv6_mode == 0)
+        local = socket_create(AF_INET, SOCK_STREAM, 0);
+    else
+        local = socket_create(AF_INET6, SOCK_STREAM, 0);
+
     if (logger_flag && logger_file == NULL)
         logger_file = fopen("stat.log", "wb");
 
-    socket_init();
+    loop = event_init(EVENT_BACKEND_SELECT);
 
-    if (ipv6_mode == 0)
-        local_tcp = socket_create(AF_INET, SOCK_STREAM, 0);
-    else
-        local_tcp = socket_create(AF_INET6, SOCK_STREAM, 0);
+    if (local != INVALID_SOCKET && loop != NULL) {
+        set_socket(local);
+        set_nodelay(local, 1);
 
-    set_socket(local_tcp);
-    set_nodelay(local_tcp, 1);
+        if (socket_bind(local, local_host, local_port) != SOCKET_ERROR) {
+            if (socket_listen(local, MAX_CLIENTS) != SOCKET_ERROR) {
+                printf("listen on tcp socket success, socket: %d, host: %s, port: %s\n", local, local_host, local_port);
 
-    if (local_tcp != INVALID_SOCKET && socket_bind(local_tcp, local_host, local_port) != SOCKET_ERROR) {
-        if (socket_listen(local_tcp, MAX_CLIENTS) == 0) {
-            printf("listen on tcp socket success, socket: %d, host: %s, port: %s\n", local_tcp, local_host, local_port);
-            event_io_add(local_tcp, EVENT_IO_READ, NULL, local_tcp_cb);
-            event_io_start(local_tcp, EVENT_IO_READ);
+                event_io_init(&local_accept, local_accept_cb, local, EVENT_IO_READ);
+                event_io_start(loop, &local_accept);
+            }
         }
     }
 
-    event_loop();
+    event_run(loop, EVENT_RUN_DEFAULT);
 
-    if (local_tcp != INVALID_SOCKET)
-        socket_close(local_tcp);
-
-    clean_proxy(&list);
-    socket_clean();
+    event_clean(loop);
 
     if (logger_flag && logger_file != NULL)
         fclose(logger_file);
+
+    if (local != INVALID_SOCKET)
+        socket_close(local);
+
+    socket_clean();
 
     return 0;
 }
