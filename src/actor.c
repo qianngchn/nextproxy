@@ -66,7 +66,7 @@ static inline int thread_alive(pthread_t thread) {
 }
 
 // Hash table management
-HASH_TABLE *hash_init(size_t size) {
+HASH_TABLE *hash_init(uint64_t size) {
     HASH_TABLE *htable = (HASH_TABLE *)anmalloc(sizeof(HASH_TABLE));
 
     uint32_t seed = 0x00100001;
@@ -111,8 +111,8 @@ void *hash_table(const HASH_TABLE *htable, const char *key, void *data, int acti
     uint32_t hash1 = hash_string(htable, key, 1);
     uint32_t hash2 = hash_string(htable, key, 2);
 
-    size_t cur = hash & (htable->size - 1);
-    size_t pos = cur, max = htable->size, exist = 0;
+    uint64_t cur = hash & (htable->size - 1);
+    uint64_t pos = cur, max = htable->size, exist = 0;
 
     while (1) {
         pthread_spin_lock(&htable->elems[pos].lock);
@@ -242,6 +242,25 @@ void buffer_clean(RING_BUFFER *buffer) {
 // Actor model section
 static inline void root_callback(ACTOR_ROOT *root, void *data) { actor_broadcast(root, data); }
 
+static inline int send_mail(ACTOR_ROOT *root, ACTOR_NODE *node, void *data) {
+    uint64_t old = node->status, new = 0;
+
+    if (!(old & ACTOR_DEFAULT && old & ACTOR_RUNNABLE)) return 0;
+
+    if (buffer_size(node->inbox) >= root->maxinbox - 1) return 0;
+
+    while (!buffer_write(node->inbox, data));
+
+    if (!(old & ACTOR_RUNTASK)) {
+        new = old | ACTOR_RUNTASK;
+
+        if (bool_cas(&node->status, old, new) && buffer_size(root->task) < root->maxnode)
+            while (!buffer_write(root->task, node));
+    }
+
+    return 1;
+}
+
 ACTOR_ROOT *actor_init(const char *name, size_t maxnode, size_t maxworker, size_t maxinbox) {
     if (name == NULL || maxnode == 0 || maxworker == 0 || maxinbox == 0) return NULL;
 
@@ -260,7 +279,6 @@ ACTOR_ROOT *actor_init(const char *name, size_t maxnode, size_t maxworker, size_
     root->inbox = buffer_init(maxinbox);
 
     root->breakout = 0;
-    root->nodecnt = 0;
 
     root->nodes = (ACTOR_NODE *)anmalloc(sizeof(ACTOR_NODE) * maxnode);
     memset(root->nodes, 0, sizeof(ACTOR_NODE) * maxnode);
@@ -284,12 +302,14 @@ ACTOR_ROOT *actor_init(const char *name, size_t maxnode, size_t maxworker, size_
 
 static void *thread_worker(void *data) {
     ACTOR_ROOT *root = (ACTOR_ROOT *)data;
-    ACTOR_NODE *node = NULL; uint64_t size = 0;
+    ACTOR_NODE *node = NULL; uint64_t status = 0;
 
-    while (root->nodecnt && !root->breakout) {
-        size = buffer_size(root->task);
+    while (!root->breakout) {
+        if (buffer_size(root->task) == 0) {
+            pthread_mutex_lock(&root->masterlock);
+            pthread_cond_signal(&root->mastercond);
+            pthread_mutex_unlock(&root->masterlock);
 
-        if (size == 0) {
             pthread_mutex_lock(&root->workerlock);
             pthread_cond_wait(&root->workercond, &root->workerlock);
             pthread_mutex_unlock(&root->workerlock);
@@ -297,20 +317,15 @@ static void *thread_worker(void *data) {
         }
 
         if (buffer_read(root->task, &data) && data != NULL) {
-            node = (ACTOR_NODE *)data;
-            if (!(node->status & (ACTOR_DEFAULT | ACTOR_RUNNABLE | ACTOR_RUNTASK)))
-                continue;
+            node = (ACTOR_NODE *)data; status = node->status;
 
-            while (buffer_size(node->inbox)) {
-                if (buffer_read(node->inbox, &data)) {
-                    if (node->cb != NULL) {
-                        node->cb(root, data);
-                        loop_delay(100);
-                    }
+            if (status & ACTOR_RUNNABLE && status & ACTOR_RUNTASK) {
+                while (buffer_read(node->inbox, &data)) {
+                    if (node->cb != NULL) { node->cb(root, data); loop_delay(100); }
                 }
             }
 
-            sync_xor(int, node->status, ACTOR_RUNTASK);
+            sync_xor(uint64_t, node->status, ACTOR_RUNTASK);
         }
     }
 
@@ -318,24 +333,24 @@ static void *thread_worker(void *data) {
 }
 
 static void *thread_master(void *data) {
-    int i = 0, retry = 100; uint64_t size = 0;
+    size_t i = 0, retry = 10; uint64_t size = 0;
     ACTOR_ROOT *root = (ACTOR_ROOT *)data;
 
-    while (root->nodecnt && !root->breakout) {
-        loop_delay(100);
+    while (!root->breakout) {
+        //loop_delay(100);
         size = buffer_size(root->task);
 
         if (size == 0) {
-            if (retry == 0) {
+            //if (retry == 0) {
                 pthread_mutex_lock(&root->masterlock);
                 pthread_cond_wait(&root->mastercond, &root->masterlock);
                 pthread_mutex_unlock(&root->masterlock);
-            } else
+            //} else
                 --retry;
 
             continue;
         } else {
-            retry = 100;
+            retry = 10;
 
             if (size > root->maxworker)
                 size = root->maxworker;
@@ -352,12 +367,12 @@ static void *thread_master(void *data) {
                 }
 
                 pthread_attr_destroy(&attr);
+            } else {
+                pthread_mutex_lock(&root->workerlock);
+                pthread_cond_signal(&root->workercond);
+                pthread_mutex_unlock(&root->workerlock);
             }
         }
-
-        pthread_mutex_lock(&root->workerlock);
-        pthread_cond_broadcast(&root->workercond);
-        pthread_mutex_unlock(&root->workerlock);
     }
 
     pthread_mutex_lock(&root->workerlock);
@@ -389,7 +404,7 @@ void actor_run(ACTOR_ROOT *root) {
 }
 
 ACTOR_NODE *actorn_manage(ACTOR_ROOT *root, ACTOR_NODE *node, ACTOR_CB cb, int action) {
-    int i = 0; if (root == NULL) return NULL;
+    size_t i = 0; if (root == NULL) return NULL;
 
     if (action == ACTORN_FIND) {
         for (i = 0; i < root->maxnode; ++i)
@@ -398,62 +413,41 @@ ACTOR_NODE *actorn_manage(ACTOR_ROOT *root, ACTOR_NODE *node, ACTOR_CB cb, int a
 
         if (i == root->maxnode) return NULL;
     } else if (action == ACTORN_SET) {
-        if (node != NULL && !(node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK)))
-            sync_value(ACTOR_CB, node->cb, cb);
-        else
-            return NULL;
+        if (node == NULL || node->status & ACTOR_RUNNABLE) return NULL;
+
+        sync_value(ACTOR_CB, node->cb, cb);
     } else if (action == ACTORN_CREATE) {
-        for (i = 0; i < root->maxnode; ++i)
-            if (root->nodes[i].status == 0)
-                break;
+        for (i = 0; i < root->maxnode; ++i) {
+            if (root->nodes + i == node) return NULL;
+
+            if (root->nodes[i].status == 0) break;
+        }
 
         if (i == root->maxnode) return NULL;
 
         node = &root->nodes[i];
 
-        sync_value(int, node->status, ACTOR_DEFAULT);
+        sync_value(uint64_t, node->status, ACTOR_DEFAULT);
         sync_value(ACTOR_CB, node->cb, cb);
         node->inbox = buffer_init(root->maxinbox);
-
-        sync_add(size_t, root->nodecnt, 1);
     } else if (action == ACTORN_START) {
-        if (node != NULL && !(node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK)))
-            sync_or(int, node->status, ACTOR_RUNNABLE);
-    } else if (action == ACTORN_STOP) {
-        if (node != NULL && node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK))
-            sync_xor(int, node->status, (ACTOR_RUNNABLE | ACTOR_RUNTASK));
-    } else if (action == ACTORN_DELETE) {
-        if (node != NULL && !(node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK))) {
-            sync_value(int, node->status, 0);
-            sync_value(ACTOR_CB, node->cb, NULL);
-            buffer_clean(node->inbox);
+        if (node == NULL || node->status & ACTOR_RUNNABLE) return node;
 
-            sync_sub(size_t, root->nodecnt, 1);
-        } else
-            return NULL;
+        sync_or(uint64_t, node->status, ACTOR_RUNNABLE);
+    } else if (action == ACTORN_STOP) {
+        if (node == NULL || !(node->status & ACTOR_RUNNABLE)) return node;
+
+        sync_xor(uint64_t, node->status, ACTOR_RUNNABLE);
+    } else if (action == ACTORN_DELETE) {
+        if (node == NULL || node->status != ACTOR_DEFAULT) return NULL;
+
+        sync_value(uint64_t, node->status, 0);
+        sync_value(ACTOR_CB, node->cb, NULL);
+        buffer_clean(node->inbox);
     } else
         return NULL;
 
     return node;
-}
-
-static inline int send_mail(ACTOR_ROOT *root, ACTOR_NODE *node, void *data) {
-    int old = node->status, new = 0;
-
-    if (old & ACTOR_RUNNABLE) {
-        if (buffer_size(node->inbox) >= root->maxinbox - 1) return 0;
-
-        while (!buffer_write(node->inbox, data));
-
-        if (!(old & ACTOR_RUNTASK)) {
-            new = old | ACTOR_RUNTASK;
-
-            if (bool_cas(&node->status, old, new) && buffer_size(root->task) < root->maxnode)
-                while (!buffer_write(root->task, node));
-        }
-    }
-
-    return 1;
 }
 
 int actorn_send(ACTOR_ROOT *root, ACTOR_NODE *node, void *data) {
@@ -471,7 +465,7 @@ int actorn_send(ACTOR_ROOT *root, ACTOR_NODE *node, void *data) {
 int actors_manage(ACTOR_ROOT *root, const char *name, ACTOR_CB cb, int action) {
     if (root == NULL || name == NULL) return 0;
 
-    int i = 0; ACTOR_NODE *node = NULL;
+    size_t i = 0; ACTOR_NODE *node = NULL;
 
     if (action == ACTORS_FIND) {
         node = hash_table(root->nodestable, name, NULL, HTABLE_FIND);
@@ -482,10 +476,9 @@ int actors_manage(ACTOR_ROOT *root, const char *name, ACTOR_CB cb, int action) {
 
         if (node == NULL) return 0;
 
-        if (!(node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK)))
-            sync_value(ACTOR_CB, node->cb, cb);
-        else
-            return 0;
+        if (node->status & ACTOR_RUNNABLE) return 0;
+
+        sync_value(ACTOR_CB, node->cb, cb);
     } else if (action == ACTORS_CREATE) {
         for (i = 0; i < root->maxnode; ++i)
             if (root->nodes[i].status == 0)
@@ -497,38 +490,35 @@ int actors_manage(ACTOR_ROOT *root, const char *name, ACTOR_CB cb, int action) {
 
         if (hash_table(root->nodestable, name, node, HTABLE_CREATE) == NULL) return 0;
 
-        sync_value(int, node->status, ACTOR_DEFAULT);
+        sync_value(uint64_t, node->status, ACTOR_DEFAULT);
         sync_value(ACTOR_CB, node->cb, cb);
         node->inbox = buffer_init(root->maxinbox);
-
-        sync_add(size_t, root->nodecnt, 1);
     } else if (action == ACTORS_START) {
         node = hash_table(root->nodestable, name, NULL, HTABLE_FIND);
 
         if (node == NULL) return 0;
 
-        if (!(node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK)))
-            sync_or(int, node->status, ACTOR_RUNNABLE);
+        if (node->status & ACTOR_RUNNABLE) return 1;
+
+        sync_or(uint64_t, node->status, ACTOR_RUNNABLE);
     } else if (action == ACTORS_STOP) {
         node = hash_table(root->nodestable, name, NULL, HTABLE_FIND);
 
         if (node == NULL) return 0;
 
-        if (node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK))
-            sync_xor(int, node->status, (ACTOR_RUNNABLE | ACTOR_RUNTASK));
+        if (!(node->status & ACTOR_RUNNABLE)) return 1;
+
+        sync_xor(uint64_t, node->status, ACTOR_RUNNABLE);
     } else if (action == ACTORS_DELETE) {
         node = hash_table(root->nodestable, name, NULL, HTABLE_DELETE);
 
         if (node == NULL) return 0;
 
-        if (!(node->status & (ACTOR_RUNNABLE | ACTOR_RUNTASK))) {
-            sync_value(int, node->status, 0);
-            sync_value(ACTOR_CB, node->cb, NULL);
-            buffer_clean(node->inbox);
+        if (node->status != ACTOR_DEFAULT) return 0;
 
-            sync_sub(size_t, root->nodecnt, 1);
-        } else
-            return 0;
+        sync_value(uint64_t, node->status, 0);
+        sync_value(ACTOR_CB, node->cb, NULL);
+        buffer_clean(node->inbox);
     } else
         return 0;
 
@@ -542,11 +532,17 @@ int actors_send(ACTOR_ROOT *root, const char *name, void *data) {
 
     if (node == NULL) return 0;
 
-    return actorn_send(root, node, data);
+    if (!send_mail(root, node, data)) return 0;
+
+    pthread_mutex_lock(&root->masterlock);
+    pthread_cond_signal(&root->mastercond);
+    pthread_mutex_unlock(&root->masterlock);
+
+    return 1;
 }
 
 int actor_broadcast(ACTOR_ROOT *root, void *data) {
-    int i = 0; if (root == NULL) return 0;
+    uint64_t i = 0; if (root == NULL) return 0;
 
     for (i = 0; i < root->maxnode; ++i)
         if (!send_mail(root, &root->nodes[i], data)) return 0;
@@ -648,7 +644,7 @@ void ping_cb(ACTOR_ROOT *root, void *data) {
     ++(*count);
 
     printf("count: %d\n", *count);
-    actors_send(root, "pong", data);
+    while (!actors_send(root, "pong", data));
 }
 
 void pong_cb(ACTOR_ROOT *root, void *data) {
@@ -658,7 +654,9 @@ void pong_cb(ACTOR_ROOT *root, void *data) {
 
     printf("count: %d\n", *count);
     if (*count != 10000)
-        actors_send(root, "ping", data);
+        while (!actors_send(root, "ping", data));
+    else
+        actor_break(root);
 }
 
 int main(int argc, char **argv) {
@@ -689,17 +687,16 @@ int main(int argc, char **argv) {
     actors_send(root, "consumer2", &data);
     actors_send(root, "ping", &count);
 
-    while (1) {
-        sleep(1);
-        printf("data: %p, %d, nodecnt: %lu, breakout: %d\n", &data, data, root->nodecnt, root->breakout);
-        printf("node[0] size: %lu\n", buffer_size(root->nodes[0].inbox));
-        printf("node[1] size: %lu\n", buffer_size(root->nodes[1].inbox));
-        printf("node[2] size: %lu\n", buffer_size(root->nodes[2].inbox));
-        printf("node[3] size: %lu\n", buffer_size(root->nodes[3].inbox));
-        printf("node[4] size: %lu\n", buffer_size(root->nodes[4].inbox));
-        printf("node[5] size: %lu\n", buffer_size(root->nodes[5].inbox));
-        printf("node[6] size: %lu\n", buffer_size(root->nodes[6].inbox));
-    }
+    sleep(1);
+    printf("data: %p, %d, breakout: %d\n", &data, data, root->breakout);
+    printf("node[0] size: %lu\n", buffer_size(root->nodes[0].inbox));
+    printf("node[1] size: %lu\n", buffer_size(root->nodes[1].inbox));
+    printf("node[2] size: %lu\n", buffer_size(root->nodes[2].inbox));
+    printf("node[3] size: %lu\n", buffer_size(root->nodes[3].inbox));
+    printf("node[4] size: %lu\n", buffer_size(root->nodes[4].inbox));
+    printf("node[5] size: %lu\n", buffer_size(root->nodes[5].inbox));
+    printf("node[6] size: %lu\n", buffer_size(root->nodes[6].inbox));
+    printf("task size: %lu\n", buffer_size(root->task));
 
     actor_wait(root);
 

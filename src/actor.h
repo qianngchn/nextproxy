@@ -11,7 +11,7 @@ extern "C" {
 #define loop_delay(cnt) do { size_t count = (cnt); while (count) --count; } while (0)
 
 typedef struct hash_elem {
-    uint32_t volatile exist;
+    uint64_t volatile exist;
     uint32_t volatile hash1;
     uint32_t volatile hash2;
     void * volatile data;
@@ -22,7 +22,7 @@ typedef struct hash_elem {
 typedef struct hash_table {
     uint32_t table[1280];
     HASH_ELEM *elems;
-    size_t size;
+    uint64_t size;
 } __attribute__ ((aligned(8))) HASH_TABLE;
 
 enum {
@@ -32,7 +32,7 @@ enum {
     HTABLE_DELETE
 };
 
-HASH_TABLE *hash_init(size_t size);
+HASH_TABLE *hash_init(uint64_t size);
 
 uint32_t hash_string(const HASH_TABLE *htable, const char *str, uint32_t type);
 
@@ -76,20 +76,19 @@ typedef struct actor_root ACTOR_ROOT;
 typedef void (*ACTOR_CB)(struct actor_root *root, void *data);
 
 typedef struct actor_node {
-    int volatile status;
+    uint64_t volatile status;
     ACTOR_CB volatile cb;
     RING_BUFFER *inbox;
     uint64_t p1, p2, p3, p4, p5;
 } __attribute__ ((aligned(8))) ACTOR_NODE;
 
 typedef struct actor_root {
-    int volatile status;
+    uint64_t volatile status;
     ACTOR_CB volatile cb;
     RING_BUFFER *inbox;
     uint64_t p1, p2, p3, p4, p5;
 
     int volatile breakout;
-    size_t volatile nodecnt;
 
     HASH_TABLE *nodestable;
     ACTOR_NODE *nodes;
